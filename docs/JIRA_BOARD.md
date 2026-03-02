@@ -67,6 +67,7 @@ Estado permitido: `TODO`, `IN_PROGRESS`, `BLOCKED`, `DONE`.
 | JNE-065 | Documentacion de prompts por seccion | DONE | Dev | `docs/COPILOT_PROMPTS.md` con contratos y responsabilidades |
 | JNE-066 | Flexibilidad por entidad en planner IA (`answer_level`) | DONE | Dev | Planner soporta candidato/partido/segmento y evita asumir solo `id_hoja_vida` |
 | JNE-067 | Evidencias y citas para resultados agregados (`[ROW:n]`) | DONE | Dev | `ask-ai` y narracion IA citan filas agregadas cuando no hay ID de candidato |
+| JNE-068 | Modo de ejecucion derivada en planner (`execution_mode`) | DONE | Dev | Agente decide `sql|derived`; resolver `income_amount_ranking` para montos de ingresos |
 | JNE-068 | Segmentacion explícita de Diputados en BD | DONE | Dev | `segmento_postulacion=DIPUTADOS` + vistas de resumen actualizadas |
 | JNE-069 | Ingesta completa Diputados con detalle (tipo 15) | DONE | Dev | Corridas productivas con detalle completo en `hoja_vida/anotaciones/expedientes` |
 | JNE-070 | Particionado de ingesta para cargas masivas | DONE | Dev | Flags `--partition-mod/--partition-rem` + soporte config/env |
@@ -130,6 +131,7 @@ Estado permitido: `TODO`, `IN_PROGRESS`, `BLOCKED`, `DONE`.
 - 2026-02-28: Endurecimiento adicional de prompts/validacion del planner SQL IA: JSON estricto, reglas de filtros obligatorios (`estado/organizacion`) y ejemplos in-prompt.
 - 2026-02-28: Refactor a arquitectura de dos agentes IA en `ask-ai`: `Objective Agent` (intencion/objetivo) + `SQL Builder Agent` (query/required_data), con chequeo de alineacion entre ambos.
 - 2026-02-28: JNE-066 y JNE-067 movidos a `DONE` con contrato `answer_level` (candidate/organization/election_segment/general), validacion SQL por nivel de respuesta y citas `[ROW:n]` para resultados agregados por partido/segmento.
+- 2026-02-28: JNE-068 movido a `DONE` con contrato `execution_mode`/`derived_resolver` para que la IA elija ejecucion derivada sin hardcode por query (caso ingresos por monto desde `declaracion_ingresos`).
 - 2026-02-28: JNE-048 movido a `DONE` al dejar `candidato/avanzadaexporta` como búsqueda primaria (sin recaptcha) con fallback al flujo anterior.
 - 2026-02-28: JNE-045 movido a `DONE` con corrida completa Senado tipo 20 (`run_id=7d50131b-1f81-4d7a-9b11-f3806a365d75`, `1131` leídos/persistidos, `0` errores).
 - 2026-02-28: JNE-046 movido a `DONE` con corrida completa Senado tipo 21 (`run_id=e6f20bd7-50e8-44e0-b951-d87e078fbd60`, `1833` leídos/persistidos, `0` errores); en fuente `avanzadaexporta` hay un `idHojaVida` repetido (`248725`) y por eso quedan `1832` postulaciones únicas.

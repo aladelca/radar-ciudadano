@@ -20,6 +20,8 @@ class OpenAICopilotError(RuntimeError):
 _VALID_PLAN_INTENTS = {"aggregate_count", "search"}
 _VALID_PLAN_RESULT_TYPES = {"aggregate", "rows"}
 _VALID_ANSWER_LEVELS = {"candidate", "organization", "election_segment", "general"}
+_VALID_EXECUTION_MODES = {"sql", "derived"}
+_VALID_DERIVED_RESOLVERS = {"income_amount_ranking"}
 _SEGMENT_SENADO_PATTERN = re.compile(r"\b(senad|senador|senadores|senado)\b", flags=re.IGNORECASE)
 _SEGMENT_PRESIDENCIAL_PATTERN = re.compile(
     r"\b(presidencial|presidente|presidencia)\b",
@@ -228,11 +230,13 @@ class OpenAICopilotService:
         elapsed_ms = (time.perf_counter() - start) * 1000
         sql_preview = str(sql_plan.get("sql") or "").replace("\n", " ")[:220]
         logger.info(
-            "SQL builder agent | query=%s intent=%s result_type=%s answer_level=%s can_answer=%s elapsed_ms=%.1f sql=%s",
+            "SQL builder agent | query=%s intent=%s result_type=%s answer_level=%s mode=%s resolver=%s can_answer=%s elapsed_ms=%.1f sql=%s",
             (query or "").strip()[:140],
             sql_plan.get("intent"),
             sql_plan.get("result_type"),
             sql_plan.get("answer_level"),
+            sql_plan.get("execution_mode"),
+            sql_plan.get("derived_resolver"),
             sql_plan.get("can_answer"),
             elapsed_ms,
             sql_preview,
@@ -368,12 +372,20 @@ class OpenAICopilotService:
         if result_type not in _VALID_PLAN_RESULT_TYPES:
             raise OpenAICopilotError("Planner SQL IA devolvio result_type invalido.")
         answer_level = self._normalize_answer_level(parsed.get("answer_level"))
+        execution_mode_raw = str(parsed.get("execution_mode") or "").strip().lower()
+        execution_mode = execution_mode_raw if execution_mode_raw in _VALID_EXECUTION_MODES else "sql"
+        derived_resolver_raw = str(parsed.get("derived_resolver") or "").strip().lower()
+        derived_resolver = derived_resolver_raw or None
+        can_answer = self._parse_bool(parsed.get("can_answer"))
+        if execution_mode == "derived" and can_answer and derived_resolver not in _VALID_DERIVED_RESOLVERS:
+            raise OpenAICopilotError("Planner SQL IA devolvio derived_resolver invalido.")
+        if execution_mode == "sql":
+            derived_resolver = None
         if not self._has_explicit_count_intent(query) and intent == "aggregate_count":
             intent = "search"
         if self._is_ranking_query(query) and intent == "aggregate_count" and result_type == "rows":
             intent = "search"
 
-        can_answer = self._parse_bool(parsed.get("can_answer"))
         objective = str(parsed.get("objective") or "").strip()
         reasoning = str(parsed.get("reasoning") or "").strip()
         required_data = self._normalize_required_data(parsed.get("required_data"))
@@ -384,7 +396,31 @@ class OpenAICopilotService:
         if sql_text == "":
             sql_text = None
 
-        if not can_answer:
+        if execution_mode == "derived":
+            if can_answer and not derived_resolver:
+                raise OpenAICopilotError(
+                    "Planner SQL IA marco execution_mode=derived sin derived_resolver."
+                )
+            if can_answer and derived_resolver == "income_amount_ranking" and answer_level != "candidate":
+                raise OpenAICopilotError(
+                    "Planner SQL IA debe usar answer_level=candidate para income_amount_ranking."
+                )
+            if result_type != "rows":
+                raise OpenAICopilotError(
+                    "Planner SQL IA debe usar result_type=rows cuando execution_mode=derived."
+                )
+            if intent == "aggregate_count":
+                raise OpenAICopilotError(
+                    "Planner SQL IA no puede usar intent=aggregate_count con execution_mode=derived."
+                )
+            if sql_text:
+                raise OpenAICopilotError(
+                    "Planner SQL IA no debe enviar SQL cuando execution_mode=derived."
+                )
+            sql_text = None
+            if not can_answer and not missing_info:
+                missing_info = ["No hay informacion suficiente para resolver con modo derivado."]
+        elif not can_answer:
             sql_text = None
             if not missing_info:
                 missing_info = ["No hay informacion suficiente en schema para construir SQL."]
@@ -419,6 +455,8 @@ class OpenAICopilotService:
             "intent": intent,
             "result_type": result_type,
             "answer_level": answer_level,
+            "execution_mode": execution_mode,
+            "derived_resolver": derived_resolver,
             "can_answer": can_answer,
             "required_data": required_data,
             "missing_info": missing_info,
@@ -731,6 +769,9 @@ class OpenAICopilotService:
             "- Si answer_level='candidate' y result_type='rows', incluye la columna id_hoja_vida.\n"
             "- Si answer_level='organization', prioriza organizacion_politica y agregaciones por partido.\n"
             "- Si answer_level='election_segment', prioriza segmento_postulacion / tipo_eleccion.\n"
+            "- Usa execution_mode='sql' por defecto.\n"
+            "- Usa execution_mode='derived' cuando la respuesta requiera parseo avanzado de payload JSON no expresable de forma robusta en SQL directo.\n"
+            "- Resolver derivado permitido: income_amount_ranking (ranking por monto aproximado de ingresos desde declaracion_ingresos).\n"
             "- Nunca inventes tablas, columnas ni joins no presentes.\n"
             "- Si no puedes responder con schema actual: can_answer=false y sql=null."
         )
@@ -739,6 +780,7 @@ class OpenAICopilotService:
             "Esquema exacto: "
             '{"objective":"texto","intent":"aggregate_count|search","result_type":"aggregate|rows",'
             '"answer_level":"candidate|organization|election_segment|general",'
+            '"execution_mode":"sql|derived","derived_resolver":"income_amount_ranking|null",'
             '"can_answer":true,"required_data":[{"table":"t","columns":["c1"],"reason":"..." }],'
             '"missing_info":["..."],"sql":"SELECT ...","reasoning":"texto breve"}'
         )
@@ -746,43 +788,49 @@ class OpenAICopilotService:
             "EJEMPLOS:\n"
             "1) Pregunta: 'cuantos candidatos tienen sentencias?'\n"
             'Salida esperada (shape): {"objective":"contar candidatos con sentencias","intent":"aggregate_count",'
-            '"result_type":"aggregate","answer_level":"candidate","can_answer":true,'
+            '"result_type":"aggregate","answer_level":"candidate","execution_mode":"sql","derived_resolver":null,"can_answer":true,'
             '"required_data":[{"table":"v_copilot_context","columns":["sentencias_penales_count","sentencias_obligaciones_count"],'
             '"reason":"contadores de sentencias"}],'
             '"missing_info":[],"sql":"select count(*)::int as total from jne.v_copilot_context where (coalesce(sentencias_penales_count,0)+coalesce(sentencias_obligaciones_count,0))>0",'
             '"reasoning":"conteo directo sobre vista consolidada"}\n'
             "2) Pregunta: 'dame evaluacion de propuestas economicas de plan de gobierno 2027'\n"
-            'Si schema no tiene tabla/campos de planes: {"objective":"evaluar propuestas economicas","intent":"search","result_type":"rows","answer_level":"general",'
+            'Si schema no tiene tabla/campos de planes: {"objective":"evaluar propuestas economicas","intent":"search","result_type":"rows","answer_level":"general","execution_mode":"sql","derived_resolver":null,'
             '"can_answer":false,"required_data":[],"missing_info":["No existe tabla/campo de planes de gobierno en schema_context"],'
             '"sql":null,"reasoning":"sin datos estructurados suficientes"}\n'
             "3) Pregunta: 'candidatos con sentencias'\n"
             'Salida esperada (shape): {"objective":"listar candidatos con sentencias","intent":"search","result_type":"rows",'
-            '"answer_level":"candidate",'
+            '"answer_level":"candidate","execution_mode":"sql","derived_resolver":null,'
             '"can_answer":true,"required_data":[{"table":"v_copilot_context","columns":["id_hoja_vida","nombre_completo","sentencias_penales_count","sentencias_obligaciones_count"],'
             '"reason":"filtrar y listar candidatos"}],'
             '"missing_info":[],"sql":"select id_hoja_vida, nombre_completo, organizacion_politica, cargo, estado, sentencias_penales_count, sentencias_obligaciones_count from jne.v_copilot_context where (coalesce(sentencias_penales_count,0)+coalesce(sentencias_obligaciones_count,0))>0 order by (coalesce(sentencias_penales_count,0)+coalesce(sentencias_obligaciones_count,0)) desc, nombre_completo asc limit 20",'
             '"reasoning":"la pregunta pide lista, no conteo"}'
             "\n4) Pregunta: 'senadores de fuerza popular'\n"
             'Salida esperada (shape): {"objective":"listar senadores de una organizacion politica","intent":"search","result_type":"rows",'
-            '"answer_level":"candidate",'
+            '"answer_level":"candidate","execution_mode":"sql","derived_resolver":null,'
             '"can_answer":true,"required_data":[{"table":"v_candidatos_segmento_postulacion","columns":["id_hoja_vida","nombre_completo","organizacion_politica","segmento_postulacion"],'
             '"reason":"filtrar por segmento senado y partido"}],'
             '"missing_info":[],"sql":"select id_hoja_vida, nombre_completo, organizacion_politica, cargo, estado, segmento_postulacion from jne.v_candidatos_segmento_postulacion where segmento_postulacion = \'SENADO\' and upper(coalesce(organizacion_politica,\'\')) like \'%FUERZA POPULAR%\' order by nombre_completo asc limit 20",'
             '"reasoning":"consulta de segmento electoral y partido"}'
             "\n5) Pregunta: 'candidatos presidenciales'\n"
             'Salida esperada (shape): {"objective":"listar candidaturas presidenciales","intent":"search","result_type":"rows",'
-            '"answer_level":"candidate",'
+            '"answer_level":"candidate","execution_mode":"sql","derived_resolver":null,'
             '"can_answer":true,"required_data":[{"table":"v_candidatos_segmento_postulacion","columns":["id_hoja_vida","segmento_postulacion"],'
             '"reason":"filtrar solo presidencial"}],'
             '"missing_info":[],"sql":"select id_hoja_vida, nombre_completo, organizacion_politica, cargo, estado, segmento_postulacion from jne.v_candidatos_segmento_postulacion where segmento_postulacion = \'PRESIDENCIAL\' order by nombre_completo asc limit 20",'
             '"reasoning":"filtro explicito por segmento presidencial"}'
             "\n6) Pregunta: 'que partido tiene mas candidatos con denuncias?'\n"
             'Salida esperada (shape): {"objective":"identificar partido con mas candidatos con denuncias","intent":"search","result_type":"rows",'
-            '"answer_level":"organization","can_answer":true,'
+            '"answer_level":"organization","execution_mode":"sql","derived_resolver":null,"can_answer":true,'
             '"required_data":[{"table":"v_copilot_context","columns":["organizacion_politica","expedientes_count","anotaciones_count"],'
             '"reason":"agrupar por organizacion y calcular denuncias"}],'
             '"missing_info":[],"sql":"select organizacion_politica, count(*)::int as total_candidatos, sum(coalesce(expedientes_count,0)+coalesce(anotaciones_count,0))::int as total_denuncias from jne.v_copilot_context where coalesce(trim(organizacion_politica), \'\') <> \'\' and (coalesce(expedientes_count,0)+coalesce(anotaciones_count,0)) > 0 group by organizacion_politica order by total_denuncias desc, total_candidatos desc, organizacion_politica asc limit 20",'
             '"reasoning":"la pregunta es por partido, no por persona"}'
+            "\n7) Pregunta: 'candidato con mas ingresos'\n"
+            'Salida esperada (shape): {"objective":"identificar candidato con mayor ingreso declarado","intent":"search","result_type":"rows",'
+            '"answer_level":"candidate","execution_mode":"derived","derived_resolver":"income_amount_ranking","can_answer":true,'
+            '"required_data":[{"table":"declaracion_ingresos","columns":["id_hoja_vida","payload"],"reason":"extraer montos de ingresos desde payload"},'
+            '{"table":"candidatos","columns":["id_hoja_vida","nombre_completo","organizacion_politica","cargo","estado"],"reason":"enriquecer ranking por candidato"}],'
+            '"missing_info":[],"sql":null,"reasoning":"se requiere parseo de payload para monto aproximado de ingresos"}'
         )
 
         context = {

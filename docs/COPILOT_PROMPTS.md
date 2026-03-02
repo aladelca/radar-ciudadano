@@ -75,12 +75,19 @@ Responsabilidad:
 - para `answer_level=candidate` y `result_type=rows`, incluir `id_hoja_vida`.
 - para `answer_level=organization`, priorizar agrupaciones por `organizacion_politica`.
 - para `answer_level=election_segment`, priorizar `segmento_postulacion`/`tipo_eleccion`.
+- elegir `execution_mode`:
+  - `sql`: cuando basta una consulta SQL de solo lectura,
+  - `derived`: cuando se requiere parseo de payload JSON (ej. ranking de monto de ingresos).
+- resolvers derivados permitidos:
+  - `income_amount_ranking`.
 
 Salida requerida (JSON):
 
 ```json
 {
   "answer_level": "candidate|organization|election_segment|general",
+  "execution_mode": "sql|derived",
+  "derived_resolver": "income_amount_ranking|null",
   "result_type": "aggregate|rows",
   "sql": "SELECT ...",
   "reasoning": "justificacion breve"
@@ -107,6 +114,8 @@ En runtime, el planner SQL devuelve un JSON unificado:
   "intent": "aggregate_count|search",
   "result_type": "aggregate|rows",
   "answer_level": "candidate|organization|election_segment|general",
+  "execution_mode": "sql|derived",
+  "derived_resolver": "income_amount_ranking|null",
   "can_answer": true,
   "required_data": [
     {
@@ -137,3 +146,5 @@ Si `can_answer=false` o no hay `sql`, el backend usa fallback SQL local.
   - si llega `organizacion`, el SQL debe incluir condicion de `organizacion`.
 - Validacion de nivel de respuesta:
   - si `answer_level=candidate` y `result_type=rows`, el SQL debe exponer `id_hoja_vida`.
+- Ejecucion derivada:
+  - si `execution_mode=derived`, backend ejecuta resolver registrado en vez de SQL directo.

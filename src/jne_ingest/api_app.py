@@ -30,6 +30,11 @@ _STATE_INFER_PATTERNS = [
     (re.compile(r"\bimproced", flags=re.IGNORECASE), "IMPROCEDENTE"),
     (re.compile(r"\btach", flags=re.IGNORECASE), "TACHA"),
 ]
+_SEGMENT_SENADO_PATTERN = re.compile(r"\b(senad|senador|senadores|senado)\b", flags=re.IGNORECASE)
+_SEGMENT_PRESIDENCIAL_PATTERN = re.compile(
+    r"\b(presidencial|presidente|presidencia)\b",
+    flags=re.IGNORECASE,
+)
 
 
 def _new_trace_id() -> str:
@@ -489,11 +494,13 @@ def create_app() -> FastAPI:
                         if isinstance(item, dict) and item.get("table")
                     ]
                 logger.info(
-                    "copilot.ask_ai.plan | trace=%s intent=%s result_type=%s answer_level=%s can_answer=%s objective=%s required_tables=%s missing_info=%s",
+                    "copilot.ask_ai.plan | trace=%s intent=%s result_type=%s answer_level=%s execution_mode=%s derived_resolver=%s can_answer=%s objective=%s required_tables=%s missing_info=%s",
                     trace_id,
                     sql_plan.get("intent"),
                     sql_plan.get("result_type"),
                     sql_plan.get("answer_level"),
+                    sql_plan.get("execution_mode"),
+                    sql_plan.get("derived_resolver"),
                     sql_plan.get("can_answer"),
                     str(sql_plan.get("objective") or "")[:140],
                     ",".join(required_tables) if required_tables else "-",
@@ -507,11 +514,48 @@ def create_app() -> FastAPI:
                     raise OpenAICopilotError(
                         "Planner IA propuso agregado para consulta no agregada; se usa busqueda local."
                     )
-                if sql_plan.get("can_answer") and sql_plan.get("sql"):
-                    rows = repo.execute_readonly_sql(
-                        str(sql_plan.get("sql")),
-                        limit=max(payload.limit, 20),
+                if (
+                    local_query_plan.operation == "aggregate_count"
+                    and str(sql_plan.get("result_type") or "") != "aggregate"
+                ):
+                    raise OpenAICopilotError(
+                        "Planner IA devolvio filas para una consulta agregada; se usa planner local."
                     )
+                if sql_plan.get("can_answer"):
+                    execution_mode = str(sql_plan.get("execution_mode") or "sql")
+                    if execution_mode == "derived":
+                        derived_resolver = str(sql_plan.get("derived_resolver") or "")
+                        derived_result = _run_derived_resolver(
+                            repo,
+                            resolver_name=derived_resolver,
+                            limit=payload.limit,
+                            estado=effective_estado,
+                            organizacion=payload.organizacion,
+                        )
+                        rows = derived_result.get("rows", [])
+                        _validate_derived_rows_consistency(
+                            query=payload.query,
+                            rows=rows,
+                            answer_level=str(sql_plan.get("answer_level") or "general"),
+                            organizacion=payload.organizacion,
+                        )
+                        source_tables = derived_result.get("source_tables", [])
+                        if isinstance(source_tables, list):
+                            for table_name in source_tables:
+                                table_text = str(table_name or "").strip()
+                                if table_text and table_text not in required_tables:
+                                    required_tables.append(table_text)
+                        logger.info(
+                            "copilot.ask_ai.derived | trace=%s resolver=%s rows=%s",
+                            trace_id,
+                            derived_resolver,
+                            len(rows),
+                        )
+                    else:
+                        rows = repo.execute_readonly_sql(
+                            str(sql_plan.get("sql")),
+                            limit=max(payload.limit, 20),
+                        )
                     if (
                         str(sql_plan.get("result_type") or "") == "rows"
                         and str(sql_plan.get("answer_level") or "general") == "candidate"
@@ -593,15 +637,21 @@ def create_app() -> FastAPI:
                             evidence=evidence,
                             mode="ai",
                             model=ai_service.model,
-                            warning=None,
+                            warning=planner_warning,
                             session_id=session_id,
                             history_used=len(history),
                             citations=citations,
                         )
                         elapsed_ms = (time.perf_counter() - start) * 1000
+                        source_label = (
+                            "planner_derived"
+                            if str(sql_plan.get("execution_mode") or "sql") == "derived"
+                            else "planner_sql"
+                        )
                         logger.info(
-                            "copilot.ask_ai.done | trace=%s mode=ai source=planner_sql count=%s elapsed_ms=%.1f",
+                            "copilot.ask_ai.done | trace=%s mode=ai source=%s count=%s elapsed_ms=%.1f",
                             trace_id,
+                            source_label,
                             response.count,
                             elapsed_ms,
                         )
@@ -1089,3 +1139,83 @@ def _ensure_summary_result_consistency(
     if result_count > 0 and re.search(r"\bno se encontraron\b", text, flags=re.IGNORECASE):
         return (fallback_summary or text).strip()
     return text
+
+
+def _validate_derived_rows_consistency(
+    *,
+    query: str,
+    rows: Any,
+    answer_level: str,
+    organizacion: Optional[str],
+) -> None:
+    if not isinstance(rows, list):
+        raise OpenAICopilotError("Resolver derivado devolvio estructura invalida de filas.")
+    if any(not isinstance(row, dict) for row in rows):
+        raise OpenAICopilotError("Resolver derivado devolvio filas no estructuradas.")
+    if not rows:
+        return
+
+    normalized_answer_level = str(answer_level or "").strip().lower()
+    if normalized_answer_level == "candidate":
+        missing_ids = [row for row in rows if row.get("id_hoja_vida") is None]
+        if missing_ids:
+            raise OpenAICopilotError(
+                "Resolver derivado devolvio filas de candidato sin id_hoja_vida."
+            )
+
+    if organizacion:
+        target = str(organizacion).strip().upper()
+        if target:
+            mismatched = [
+                row
+                for row in rows
+                if target not in str(row.get("organizacion_politica") or "").upper()
+            ]
+            if mismatched:
+                raise OpenAICopilotError(
+                    "Resolver derivado no respeto filtro de organizacion en todas las filas."
+                )
+
+    normalized_query = str(query or "").strip().lower()
+    if _SEGMENT_SENADO_PATTERN.search(normalized_query):
+        if any(not _row_matches_segment(row, expected="SENADO") for row in rows):
+            raise OpenAICopilotError(
+                "Resolver derivado no mantuvo consistencia de segmento SENADO."
+            )
+    if _SEGMENT_PRESIDENCIAL_PATTERN.search(normalized_query):
+        if any(not _row_matches_segment(row, expected="PRESIDENCIAL") for row in rows):
+            raise OpenAICopilotError(
+                "Resolver derivado no mantuvo consistencia de segmento PRESIDENCIAL."
+            )
+
+
+def _row_matches_segment(row: Dict[str, Any], *, expected: str) -> bool:
+    segment_text = str(row.get("segmento_postulacion") or row.get("tipo_eleccion") or "").upper()
+    cargo_text = str(row.get("cargo") or "").upper()
+    if expected == "SENADO":
+        return "SENAD" in segment_text or "SENAD" in cargo_text
+    if expected == "PRESIDENCIAL":
+        return "PRESID" in segment_text or "PRESIDENT" in cargo_text
+    return True
+
+
+def _run_derived_resolver(
+    repo: CandidateReadRepository,
+    *,
+    resolver_name: str,
+    limit: int,
+    estado: Optional[str],
+    organizacion: Optional[str],
+) -> Dict[str, Any]:
+    normalized = str(resolver_name or "").strip().lower()
+    if normalized == "income_amount_ranking":
+        payload = repo.get_income_amount_ranking(
+            limit=limit,
+            estado=estado,
+            organizacion=organizacion,
+        )
+        return {
+            "rows": payload.get("rows", []),
+            "source_tables": ["declaracion_ingresos", "candidatos"],
+        }
+    raise OpenAICopilotError(f"Resolver derivado no soportado: {resolver_name}")

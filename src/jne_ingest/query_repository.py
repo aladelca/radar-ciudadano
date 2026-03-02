@@ -713,6 +713,32 @@ class CandidateReadRepository:
                     "members": unique_members,
                 }
 
+            # Semantic metric for "denuncias" used in natural language queries.
+            if (
+                "denuncias" not in catalog
+                and "expedientes_count" in count_columns
+                and "anotaciones_count" in count_columns
+            ):
+                catalog["denuncias"] = {
+                    "metric": "denuncias",
+                    "metric_field": "candidates_with_denuncias",
+                    "label": "candidato(s) con denuncias",
+                    "definition": "al menos una anotacion o expediente registrado",
+                    "expression": f"{_coalesce_expr('expedientes_count')} + {_coalesce_expr('anotaciones_count')}",
+                    "aliases": {
+                        "denuncia",
+                        "denuncias",
+                        "acusacion",
+                        "acusaciones",
+                        "expediente",
+                        "expedientes",
+                        "anotacion",
+                        "anotaciones",
+                    },
+                    "kind": "derived",
+                    "members": ["expedientes", "anotaciones"],
+                }
+
             catalog["total_candidates"] = {
                 "metric": "total_candidates",
                 "metric_field": "total_candidates",
@@ -868,6 +894,119 @@ class CandidateReadRepository:
                 "definition": str(spec.get("definition") or ""),
             }
 
+    def get_income_amount_ranking(
+        self,
+        *,
+        limit: int = 20,
+        estado: Optional[str] = None,
+        organizacion: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        start = time.perf_counter()
+        safe_limit = max(1, min(limit, 100))
+
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                select
+                    c.id_hoja_vida,
+                    c.nombre_completo,
+                    c.organizacion_politica,
+                    c.cargo,
+                    c.estado
+                from jne.candidatos c
+                where c.id_hoja_vida is not null
+                  and (%s::text is null or upper(coalesce(c.estado, '')) = upper(%s::text))
+                  and (
+                    %s::text is null
+                    or upper(coalesce(c.organizacion_politica, '')) like '%%' || upper(%s::text) || '%%'
+                  )
+                """,
+                (estado, estado, organizacion, organizacion),
+            )
+            candidates = cur.fetchall()
+
+        candidates_by_id: Dict[int, Dict[str, Any]] = {}
+        for row in candidates:
+            candidate_id = row.get("id_hoja_vida")
+            if candidate_id is None:
+                continue
+            candidates_by_id[int(candidate_id)] = {
+                "id_hoja_vida": int(candidate_id),
+                "nombre_completo": row.get("nombre_completo"),
+                "organizacion_politica": row.get("organizacion_politica"),
+                "cargo": row.get("cargo"),
+                "estado": row.get("estado"),
+            }
+
+        all_candidate_ids = sorted(candidates_by_id.keys())
+        if not all_candidate_ids:
+            return {
+                "rows": [],
+                "candidates_with_data": 0,
+                "total_candidates_considered": 0,
+            }
+
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                select id_hoja_vida, payload
+                from jne.declaracion_ingresos
+                where id_hoja_vida = any(%s::bigint[])
+                order by id_hoja_vida, item_index
+                """,
+                (all_candidate_ids,),
+            )
+            income_rows = cur.fetchall()
+
+        totals_by_candidate: Dict[int, float] = {}
+        entries_by_candidate: Dict[int, int] = {}
+        for row in income_rows:
+            candidate_id_raw = row.get("id_hoja_vida")
+            if candidate_id_raw is None:
+                continue
+            candidate_id = int(candidate_id_raw)
+            payload = row.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            amounts = _collect_monetary_values(payload)
+            if not amounts:
+                continue
+            totals_by_candidate[candidate_id] = totals_by_candidate.get(candidate_id, 0.0) + max(amounts)
+            entries_by_candidate[candidate_id] = entries_by_candidate.get(candidate_id, 0) + 1
+
+        ranked_candidate_ids = sorted(
+            totals_by_candidate.keys(),
+            key=lambda candidate_id: (
+                -totals_by_candidate[candidate_id],
+                str(candidates_by_id.get(candidate_id, {}).get("nombre_completo") or ""),
+            ),
+        )
+        rows: List[Dict[str, Any]] = []
+        for candidate_id in ranked_candidate_ids[:safe_limit]:
+            candidate = dict(candidates_by_id.get(candidate_id) or {})
+            total_amount = round(float(totals_by_candidate.get(candidate_id) or 0.0), 2)
+            candidate["ingresos_count"] = int(entries_by_candidate.get(candidate_id) or 0)
+            candidate["total_ingresos_aprox"] = total_amount
+            candidate["score"] = total_amount
+            rows.append(candidate)
+
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.info(
+            "income_amount_ranking | limit=%s estado=%s organizacion=%s candidates=%s with_data=%s rows=%s elapsed_ms=%.1f",
+            safe_limit,
+            estado,
+            organizacion,
+            len(all_candidate_ids),
+            len(totals_by_candidate),
+            len(rows),
+            elapsed_ms,
+        )
+        return {
+            "rows": rows,
+            "candidates_with_data": len(totals_by_candidate),
+            "total_candidates_considered": len(all_candidate_ids),
+        }
+
     def get_text_match_overview(
         self,
         query: str,
@@ -989,7 +1128,7 @@ class CandidateReadRepository:
 
     def get_aggregate_metrics(self) -> Dict[str, int]:
         catalog = self.get_metric_catalog()
-        projections = [sql.SQL("count(*)::int as total_candidates")]
+        projections = [sql.SQL("count(distinct id_hoja_vida)::int as total_candidates")]
         for spec in catalog.values():
             metric_key = str(spec.get("metric") or "")
             field_name = str(spec.get("metric_field") or f"candidates_with_{metric_key}")
@@ -999,7 +1138,9 @@ class CandidateReadRepository:
             if not metric_key or not expression or not _safe_identifier(field_name):
                 continue
             projections.append(
-                sql.SQL("count(*) filter (where ({expr}) > 0)::int as {alias}").format(
+                sql.SQL(
+                    "count(distinct case when ({expr}) > 0 then id_hoja_vida end)::int as {alias}"
+                ).format(
                     expr=sql.SQL(expression),
                     alias=sql.Identifier(field_name),
                 )
