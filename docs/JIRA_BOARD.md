@@ -72,6 +72,11 @@ Estado permitido: `TODO`, `IN_PROGRESS`, `BLOCKED`, `DONE`.
 | JNE-069 | Ingesta completa Diputados con detalle (tipo 15) | DONE | Dev | Corridas productivas con detalle completo en `hoja_vida/anotaciones/expedientes` |
 | JNE-070 | Particionado de ingesta para cargas masivas | DONE | Dev | Flags `--partition-mod/--partition-rem` + soporte config/env |
 | JNE-071 | Ingesta completa Parlamento Andino (tipo 3) | DONE | Dev | Corrida productiva con detalle completo y validacion fuente-vs-BD |
+| JNE-072 | Plan tecnico de pipeline multiagente para copilot IA | DONE | Dev | `docs/PLAN_COPILOT_MULTIAGENT_PIPELINE.md` con arquitectura y criterios |
+| JNE-073 | Schema Retrieval Agent para seleccion de tablas/joins | DONE | Dev | Agente de data requirements + normalizacion/guardrails |
+| JNE-074 | SQL Critic + SQL Repair loop en planner IA | DONE | Dev | Critica semantica/tecnica y reparacion automatica (1 intento) |
+| JNE-075 | Refactor de prompts multiagente y contratos JSON | DONE | Dev | Prompts separados (objective/schema/builder/critic/repair) documentados |
+| JNE-076 | Observabilidad de resultados por agente en logs | DONE | Dev | Logs estructurados por etapa y decision de pipeline |
 
 ## Registro de cambios
 
@@ -140,3 +145,5 @@ Estado permitido: `TODO`, `IN_PROGRESS`, `BLOCKED`, `DONE`.
 - 2026-03-01: JNE-070 movido a `DONE` al habilitar particionado por `id_hoja_vida` en `run_ingest` (`--partition-mod/--partition-rem` y `JNE_PARTITION_MOD/JNE_PARTITION_REM`).
 - 2026-03-01: JNE-069 movido a `DONE` tras ingesta completa Diputados (tipo 15) en 4 particiones (`run_id=03aafaba-a555-430b-888c-52ce6f4954b9`, `6421759e-8223-4ecf-ae90-2f17af47d517`, `635983b7-a3b2-4e68-aeb6-675fe6ad5860`, `2d6bd617-3028-47f6-bb4e-6f2fd2a2e1f3`): `1377 + 1399 + 1348 + 1341 = 5465`, con detalle completo persistido y `0` errores por corrida.
 - 2026-03-01: JNE-071 movido a `DONE` tras ingesta completa Parlamento Andino (tipo 3, `run_id=30ffe044-9bcd-4eeb-897c-a790b3f44f62`): `528` leídos/persistidos, `0` errores, y validación fuente-vs-BD sin faltantes.
+- 2026-03-02: Se abre bloque multiagente del copilot con JNE-072..JNE-076; JNE-072 inicia en `IN_PROGRESS` para formalizar arquitectura Objective -> Schema -> Builder -> Critic -> Repair.
+- 2026-03-02: JNE-072..JNE-076 movidos a `DONE` con pipeline multiagente implementado en `OpenAICopilotService` (Objective + Schema Retrieval + SQL Builder + SQL Critic + SQL Repair), observabilidad por etapa y actualización de `docs/COPILOT_PROMPTS.md`.

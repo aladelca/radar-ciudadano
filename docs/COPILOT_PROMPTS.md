@@ -1,112 +1,83 @@
-# Copilot Prompts (Planner + SQL + Narracion)
+# Copilot Prompts - Pipeline Multiagente (SQL Planner)
 
-Fecha: 2026-02-28
+Fecha: 2026-03-02
 
 ## Objetivo
 
 Definir prompts separados para que el copilot:
 
-1. identifique el objetivo de la pregunta del usuario,
-2. valide la informacion necesaria en la base de datos (`schema jne`),
-3. genere SQL de solo lectura para responder,
-4. narre el resultado sin inventar datos.
+1. entienda la intencion del usuario,
+2. identifique data necesaria en el schema real,
+3. construya SQL seguro y alineado al objetivo,
+4. critique consistencia semantica/tecnica,
+5. repare el SQL si aplica (1 intento maximo),
+6. narre resultado final con evidencia.
 
-Arquitectura en runtime:
+## Arquitectura en runtime
 
-- `Objective Agent`: interpreta que quiere saber el usuario.
-- `SQL Builder Agent`: construye query y chequea data requerida en schema.
-- `Narration Agent`: redacta respuesta final sobre evidencia SQL.
+- `Objective Agent`
+- `Schema Retrieval Agent`
+- `SQL Builder Agent`
+- `SQL Critic Agent`
+- `SQL Repair Agent` (solo si critic devuelve `repair`)
+- `Narration Agent`
 
-## Prompt 1: Objective Detection
+## Prompt 1: Objective Agent
 
 Responsabilidad:
 
-- clasificar la intencion (`aggregate_count` o `search`),
-- resumir el objetivo de negocio de la pregunta.
-- definir `answer_level` segun entidad principal de respuesta:
-  - `candidate` (persona),
-  - `organization` (partido/organizacion),
-  - `election_segment` (presidencial/senado),
-  - `general` (mixto/ambiguo).
+- detectar `objective`,
+- clasificar `intent` (`aggregate_count|search`),
+- definir `answer_level` (`candidate|organization|election_segment|general`).
 
-Salida requerida (JSON):
+Salida JSON:
 
 ```json
 {
   "objective": "texto",
   "intent": "aggregate_count|search",
-  "answer_level": "candidate|organization|election_segment|general"
+  "answer_level": "candidate|organization|election_segment|general",
+  "reasoning": "breve"
 }
 ```
 
-## Prompt 2: Data Requirements Check
+## Prompt 2: Schema Retrieval Agent
 
 Responsabilidad:
 
-- revisar `schema_context` (tablas/columnas reales en `jne`),
-- listar tablas/columnas necesarias para responder,
-- indicar faltantes si no existe data suficiente.
+- revisar `schema_context` real,
+- seleccionar tablas/columnas necesarias,
+- declarar faltantes cuando no exista data suficiente.
 
-Salida requerida (JSON):
+Salida JSON:
 
 ```json
 {
   "can_answer": true,
   "required_data": [
     {
-      "table": "jne.alguna_tabla",
-      "columns": ["columna_1", "columna_2"],
-      "reason": "por que se necesita"
+      "table": "v_copilot_context",
+      "columns": ["id_hoja_vida", "nombre_completo"],
+      "reason": "perfil de candidato"
     }
   ],
-  "missing_info": []
+  "missing_info": [],
+  "preferred_tables": ["v_copilot_context"],
+  "join_hints": ["id_hoja_vida"],
+  "reasoning": "breve"
 }
 ```
 
-## Prompt 3: SQL Generation
+## Prompt 3: SQL Builder Agent
 
 Responsabilidad:
 
-- producir una sola consulta SQL (`SELECT` o `WITH ... SELECT`) compatible con Postgres,
-- no inventar tablas/columnas fuera del `schema_context`,
-- en conteos usar alias sugerido `total`.
-- aplicar filtros `estado/organizacion` cuando se reciban en la request.
-- no usar `aggregate_count` si la pregunta no solicita cantidad explícita.
-- para `answer_level=candidate` y `result_type=rows`, incluir `id_hoja_vida`.
-- para `answer_level=organization`, priorizar agrupaciones por `organizacion_politica`.
-- para `answer_level=election_segment`, priorizar `segmento_postulacion`/`tipo_eleccion`.
-- elegir `execution_mode`:
-  - `sql`: cuando basta una consulta SQL de solo lectura,
-  - `derived`: cuando se requiere parseo de payload JSON (ej. ranking de monto de ingresos).
-- resolvers derivados permitidos:
-  - `income_amount_ranking`.
+- generar plan SQL ejecutable de solo lectura,
+- respetar `objective_plan` + `schema_plan`,
+- mantener filtros request (`estado`, `organizacion`),
+- elegir `execution_mode` (`sql|derived`).
 
-Salida requerida (JSON):
-
-```json
-{
-  "answer_level": "candidate|organization|election_segment|general",
-  "execution_mode": "sql|derived",
-  "derived_resolver": "income_amount_ranking|null",
-  "result_type": "aggregate|rows",
-  "sql": "SELECT ...",
-  "reasoning": "justificacion breve"
-}
-```
-
-## Prompt 4: Narracion Final
-
-Responsabilidad:
-
-- resumir resultado SQL de forma clara,
-- citar evidencia por entidad:
-  - `[ID:...]` para candidatos,
-  - `[ROW:...]` para filas agregadas (ej. por partido),
-- incluir seccion final `Fuentes:`.
-
-## Contrato Unificado Implementado
-
-En runtime, el planner SQL devuelve un JSON unificado:
+Salida JSON (contrato unificado):
 
 ```json
 {
@@ -130,21 +101,51 @@ En runtime, el planner SQL devuelve un JSON unificado:
 }
 ```
 
-Si `can_answer=false` o no hay `sql`, el backend usa fallback SQL local.
+## Prompt 4: SQL Critic Agent
 
-## Guardrails Implementados en Backend
+Responsabilidad:
 
-- Validacion de campos obligatorios del JSON del planner.
-- Coherencia obligatoria:
-  - `can_answer=true` requiere `sql` no nulo.
-  - `can_answer=false` fuerza `sql=null`.
-- Validacion SQL basica:
-  - solo `SELECT`/`WITH`,
-  - una sola sentencia.
-- Validacion de filtros:
-  - si llega `estado`, el SQL debe incluir condicion de `estado`,
-  - si llega `organizacion`, el SQL debe incluir condicion de `organizacion`.
-- Validacion de nivel de respuesta:
-  - si `answer_level=candidate` y `result_type=rows`, el SQL debe exponer `id_hoja_vida`.
-- Ejecucion derivada:
-  - si `execution_mode=derived`, backend ejecuta resolver registrado en vez de SQL directo.
+- validar consistencia entre objetivo, schema y SQL propuesto,
+- detectar errores semanticos (entidad, agregacion, filtros, joins),
+- decidir `accept|repair|reject`.
+
+Salida JSON:
+
+```json
+{
+  "approved": true,
+  "action": "accept|repair|reject",
+  "issues": ["..."],
+  "repair_instructions": "...",
+  "reasoning": "breve"
+}
+```
+
+## Prompt 5: SQL Repair Agent
+
+Responsabilidad:
+
+- corregir plan SQL usando feedback del critic,
+- mantener contrato del SQL Builder,
+- no inventar tablas/columnas.
+
+Salida JSON: mismo contrato del SQL Builder.
+
+## Prompt 6: Narration Agent
+
+Responsabilidad:
+
+- responder en espanol claro, sin inventar datos,
+- citar evidencia por entidad (`[ID:...]` / `[ROW:...]`),
+- terminar con `Fuentes:`.
+
+## Guardrails backend
+
+- JSON estricto por agente.
+- SQL readonly (`SELECT`/`WITH`), sin escritura/DDL.
+- Alineacion obligatoria `intent/result_type`.
+- Filtros request (`estado`/`organizacion`) obligatorios cuando se envian.
+- Para `answer_level=candidate` + `rows`: `id_hoja_vida` requerido.
+- Critic con reparacion maxima de 1 intento.
+- Fallback local si pipeline no confiable o falla validacion.
+

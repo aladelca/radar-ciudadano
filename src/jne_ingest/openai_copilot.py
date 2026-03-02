@@ -22,6 +22,7 @@ _VALID_PLAN_RESULT_TYPES = {"aggregate", "rows"}
 _VALID_ANSWER_LEVELS = {"candidate", "organization", "election_segment", "general"}
 _VALID_EXECUTION_MODES = {"sql", "derived"}
 _VALID_DERIVED_RESOLVERS = {"income_amount_ranking"}
+_VALID_CRITIC_ACTIONS = {"accept", "repair", "reject"}
 _SEGMENT_SENADO_PATTERN = re.compile(r"\b(senad|senador|senadores|senado)\b", flags=re.IGNORECASE)
 _SEGMENT_PRESIDENCIAL_PATTERN = re.compile(
     r"\b(presidencial|presidente|presidencia)\b",
@@ -157,80 +158,113 @@ class OpenAICopilotService:
         if not self._api_key:
             raise OpenAICopilotError("OPENAI_API_KEY no configurada.")
         start = time.perf_counter()
+        history = conversation_history or []
 
-        objective_prompt = self._build_objective_agent_prompt(
+        objective_plan = self._run_objective_agent(
             query=query,
-            conversation_history=conversation_history or [],
+            conversation_history=history,
         )
-        objective_payload = self._call_responses_api(
-            objective_prompt,
-            temperature=0.0,
-            max_output_tokens=350,
-        )
-        objective_text = self._extract_text(objective_payload)
-        if not objective_text:
-            raise OpenAICopilotError("Objective agent devolvio respuesta vacia.")
-        objective_parsed = self._extract_json_object(objective_text)
-        objective_plan = self._normalize_objective_agent_output(objective_parsed)
-        if not self._has_explicit_count_intent(query) and objective_plan.get("intent") == "aggregate_count":
-            objective_plan["intent"] = "search"
-        if self._is_ranking_query(query) and objective_plan.get("intent") == "aggregate_count":
-            objective_plan["intent"] = "search"
-        logger.info(
-            "Objective agent | query=%s intent=%s answer_level=%s objective=%s",
-            (query or "").strip()[:140],
-            objective_plan.get("intent"),
-            objective_plan.get("answer_level"),
-            str(objective_plan.get("objective") or "")[:160],
-        )
-
-        builder_prompt = self._build_sql_builder_prompt(
+        schema_plan = self._run_schema_retrieval_agent(
             query=query,
             objective_plan=objective_plan,
+            schema_context=schema_context,
+            conversation_history=history,
+        )
+
+        if not schema_plan.get("can_answer"):
+            result_type = "aggregate" if str(objective_plan.get("intent")) == "aggregate_count" else "rows"
+            unresolved_plan = {
+                "objective": str(objective_plan.get("objective") or "").strip(),
+                "intent": str(objective_plan.get("intent") or "search"),
+                "result_type": result_type,
+                "answer_level": str(objective_plan.get("answer_level") or "general"),
+                "execution_mode": "sql",
+                "derived_resolver": None,
+                "can_answer": False,
+                "required_data": schema_plan.get("required_data", []),
+                "missing_info": schema_plan.get("missing_info", [])
+                or ["Schema Retrieval Agent no encontro datos suficientes para responder."],
+                "sql": None,
+                "reasoning": "Schema Retrieval Agent indica falta de datos estructurados para responder.",
+                "objective_agent_reasoning": str(objective_plan.get("reasoning") or "").strip(),
+                "schema_agent_reasoning": str(schema_plan.get("reasoning") or "").strip(),
+                "critic_decision": {"approved": False, "action": "reject", "issues": ["schema_insufficient_data"]},
+            }
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            logger.info(
+                "Multiagent pipeline | query=%s can_answer=false stage=schema elapsed_ms=%.1f missing_info=%s",
+                (query or "").strip()[:140],
+                elapsed_ms,
+                len(unresolved_plan.get("missing_info", [])),
+            )
+            return unresolved_plan
+
+        sql_plan = self._run_sql_builder_agent(
+            query=query,
+            objective_plan=objective_plan,
+            schema_plan=schema_plan,
             schema_context=schema_context,
             limit=limit,
             estado=estado,
             organizacion=organizacion,
-            conversation_history=conversation_history or [],
+            conversation_history=history,
         )
-        payload = self._call_responses_api(
-            builder_prompt,
-            temperature=0.0,
-            max_output_tokens=900,
-        )
-        text = self._extract_text(payload)
-        if not text:
-            raise OpenAICopilotError("SQL builder agent devolvio respuesta vacia.")
+        sql_plan = self._align_plan_with_objective(sql_plan, objective_plan, query=query)
 
-        parsed = self._extract_json_object(text)
-        sql_plan = self._normalize_sql_plan_output(
-            parsed,
+        critic = self._run_sql_critic_agent(
             query=query,
-            estado=estado,
-            organizacion=organizacion,
+            objective_plan=objective_plan,
+            schema_plan=schema_plan,
+            sql_plan=sql_plan,
+            conversation_history=history,
         )
-        objective_intent = str(objective_plan.get("intent") or "")
-        sql_intent = str(sql_plan.get("intent") or "")
-        if objective_intent and sql_intent and objective_intent != sql_intent:
-            if objective_intent == "search" and sql_intent == "aggregate_count":
-                raise OpenAICopilotError(
-                    "Desalineacion agentes: objective=search pero sql_builder=aggregate_count."
-                )
-            sql_plan["intent"] = objective_intent
-        objective_answer_level = str(objective_plan.get("answer_level") or "").strip()
-        if objective_answer_level in _VALID_ANSWER_LEVELS and objective_answer_level != "general":
-            if str(sql_plan.get("answer_level") or "").strip() != objective_answer_level:
-                sql_plan["answer_level"] = objective_answer_level
 
-        objective_text_norm = str(objective_plan.get("objective") or "").strip()
-        if objective_text_norm:
-            sql_plan["objective"] = objective_text_norm
+        repair_used = False
+        if not critic.get("approved"):
+            action = str(critic.get("action") or "")
+            if action == "repair":
+                repair_used = True
+                sql_plan = self._run_sql_repair_agent(
+                    query=query,
+                    objective_plan=objective_plan,
+                    schema_plan=schema_plan,
+                    candidate_sql_plan=sql_plan,
+                    critic=critic,
+                    limit=limit,
+                    estado=estado,
+                    organizacion=organizacion,
+                    conversation_history=history,
+                )
+                sql_plan = self._align_plan_with_objective(sql_plan, objective_plan, query=query)
+                critic = self._run_sql_critic_agent(
+                    query=query,
+                    objective_plan=objective_plan,
+                    schema_plan=schema_plan,
+                    sql_plan=sql_plan,
+                    conversation_history=history,
+                )
+                if not critic.get("approved"):
+                    raise OpenAICopilotError(
+                        "SQL Critic rechazo plan incluso despues de reparacion."
+                    )
+            else:
+                issues = critic.get("issues") or []
+                issue_text = "; ".join([str(item) for item in issues[:3]]) if isinstance(issues, list) else "n/a"
+                raise OpenAICopilotError(f"SQL Critic rechazo plan: {issue_text}")
 
         sql_plan["objective_agent_reasoning"] = str(objective_plan.get("reasoning") or "").strip()
+        sql_plan["schema_agent_reasoning"] = str(schema_plan.get("reasoning") or "").strip()
+        sql_plan["critic_decision"] = {
+            "approved": bool(critic.get("approved")),
+            "action": str(critic.get("action") or "accept"),
+            "issues": critic.get("issues") if isinstance(critic.get("issues"), list) else [],
+            "repair_used": repair_used,
+            "reasoning": str(critic.get("reasoning") or "").strip(),
+        }
         elapsed_ms = (time.perf_counter() - start) * 1000
         sql_preview = str(sql_plan.get("sql") or "").replace("\n", " ")[:220]
         logger.info(
-            "SQL builder agent | query=%s intent=%s result_type=%s answer_level=%s mode=%s resolver=%s can_answer=%s elapsed_ms=%.1f sql=%s",
+            "Multiagent pipeline | query=%s intent=%s result_type=%s answer_level=%s mode=%s resolver=%s can_answer=%s repair_used=%s elapsed_ms=%.1f sql=%s",
             (query or "").strip()[:140],
             sql_plan.get("intent"),
             sql_plan.get("result_type"),
@@ -238,6 +272,7 @@ class OpenAICopilotService:
             sql_plan.get("execution_mode"),
             sql_plan.get("derived_resolver"),
             sql_plan.get("can_answer"),
+            repair_used,
             elapsed_ms,
             sql_preview,
         )
@@ -267,6 +302,320 @@ class OpenAICopilotService:
             "objective": objective,
             "intent": intent,
             "answer_level": answer_level,
+            "reasoning": reasoning,
+        }
+
+    def _run_objective_agent(
+        self,
+        *,
+        query: str,
+        conversation_history: List[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        objective_prompt = self._build_objective_agent_prompt(
+            query=query,
+            conversation_history=conversation_history,
+        )
+        objective_payload = self._call_responses_api(
+            objective_prompt,
+            temperature=0.0,
+            max_output_tokens=350,
+        )
+        objective_text = self._extract_text(objective_payload)
+        if not objective_text:
+            raise OpenAICopilotError("Objective agent devolvio respuesta vacia.")
+        objective_parsed = self._extract_json_object(objective_text)
+        objective_plan = self._normalize_objective_agent_output(objective_parsed)
+        if not self._has_explicit_count_intent(query) and objective_plan.get("intent") == "aggregate_count":
+            objective_plan["intent"] = "search"
+        if self._is_ranking_query(query) and objective_plan.get("intent") == "aggregate_count":
+            objective_plan["intent"] = "search"
+        logger.info(
+            "Objective agent | query=%s intent=%s answer_level=%s objective=%s",
+            (query or "").strip()[:140],
+            objective_plan.get("intent"),
+            objective_plan.get("answer_level"),
+            str(objective_plan.get("objective") or "")[:160],
+        )
+        return objective_plan
+
+    def _run_schema_retrieval_agent(
+        self,
+        *,
+        query: str,
+        objective_plan: Dict[str, Any],
+        schema_context: Dict[str, Any],
+        conversation_history: List[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        prompt = self._build_schema_retrieval_prompt(
+            query=query,
+            objective_plan=objective_plan,
+            schema_context=schema_context,
+            conversation_history=conversation_history,
+        )
+        payload = self._call_responses_api(
+            prompt,
+            temperature=0.0,
+            max_output_tokens=700,
+        )
+        text = self._extract_text(payload)
+        if not text:
+            raise OpenAICopilotError("Schema Retrieval agent devolvio respuesta vacia.")
+        parsed = self._extract_json_object(text)
+        schema_plan = self._normalize_schema_agent_output(parsed)
+        logger.info(
+            "Schema agent | query=%s can_answer=%s required_tables=%s missing_info=%s preferred_tables=%s",
+            (query or "").strip()[:140],
+            schema_plan.get("can_answer"),
+            ",".join([str(item.get("table") or "") for item in schema_plan.get("required_data", []) if item.get("table")])
+            or "-",
+            len(schema_plan.get("missing_info", [])),
+            ",".join(schema_plan.get("preferred_tables", [])) or "-",
+        )
+        return schema_plan
+
+    def _run_sql_builder_agent(
+        self,
+        *,
+        query: str,
+        objective_plan: Dict[str, Any],
+        schema_plan: Dict[str, Any],
+        schema_context: Dict[str, Any],
+        limit: int,
+        estado: Optional[str],
+        organizacion: Optional[str],
+        conversation_history: List[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        builder_prompt = self._build_sql_builder_prompt(
+            query=query,
+            objective_plan=objective_plan,
+            schema_plan=schema_plan,
+            schema_context=schema_context,
+            limit=limit,
+            estado=estado,
+            organizacion=organizacion,
+            conversation_history=conversation_history,
+        )
+        payload = self._call_responses_api(
+            builder_prompt,
+            temperature=0.0,
+            max_output_tokens=1000,
+        )
+        text = self._extract_text(payload)
+        if not text:
+            raise OpenAICopilotError("SQL builder agent devolvio respuesta vacia.")
+
+        parsed = self._extract_json_object(text)
+        sql_plan = self._normalize_sql_plan_output(
+            parsed,
+            query=query,
+            estado=estado,
+            organizacion=organizacion,
+        )
+        logger.info(
+            "SQL builder agent | query=%s intent=%s result_type=%s answer_level=%s mode=%s resolver=%s can_answer=%s",
+            (query or "").strip()[:140],
+            sql_plan.get("intent"),
+            sql_plan.get("result_type"),
+            sql_plan.get("answer_level"),
+            sql_plan.get("execution_mode"),
+            sql_plan.get("derived_resolver"),
+            sql_plan.get("can_answer"),
+        )
+        return sql_plan
+
+    def _run_sql_critic_agent(
+        self,
+        *,
+        query: str,
+        objective_plan: Dict[str, Any],
+        schema_plan: Dict[str, Any],
+        sql_plan: Dict[str, Any],
+        conversation_history: List[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        prompt = self._build_sql_critic_prompt(
+            query=query,
+            objective_plan=objective_plan,
+            schema_plan=schema_plan,
+            sql_plan=sql_plan,
+            conversation_history=conversation_history,
+        )
+        payload = self._call_responses_api(
+            prompt,
+            temperature=0.0,
+            max_output_tokens=500,
+        )
+        text = self._extract_text(payload)
+        if not text:
+            raise OpenAICopilotError("SQL Critic agent devolvio respuesta vacia.")
+        parsed = self._extract_json_object(text)
+        critic = self._normalize_critic_agent_output(parsed)
+        logger.info(
+            "SQL critic agent | query=%s approved=%s action=%s issues=%s",
+            (query or "").strip()[:140],
+            critic.get("approved"),
+            critic.get("action"),
+            len(critic.get("issues", [])),
+        )
+        return critic
+
+    def _run_sql_repair_agent(
+        self,
+        *,
+        query: str,
+        objective_plan: Dict[str, Any],
+        schema_plan: Dict[str, Any],
+        candidate_sql_plan: Dict[str, Any],
+        critic: Dict[str, Any],
+        limit: int,
+        estado: Optional[str],
+        organizacion: Optional[str],
+        conversation_history: List[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        prompt = self._build_sql_repair_prompt(
+            query=query,
+            objective_plan=objective_plan,
+            schema_plan=schema_plan,
+            candidate_sql_plan=candidate_sql_plan,
+            critic=critic,
+            limit=limit,
+            estado=estado,
+            organizacion=organizacion,
+            conversation_history=conversation_history,
+        )
+        payload = self._call_responses_api(
+            prompt,
+            temperature=0.0,
+            max_output_tokens=1000,
+        )
+        text = self._extract_text(payload)
+        if not text:
+            raise OpenAICopilotError("SQL Repair agent devolvio respuesta vacia.")
+        parsed = self._extract_json_object(text)
+        repaired = self._normalize_sql_plan_output(
+            parsed,
+            query=query,
+            estado=estado,
+            organizacion=organizacion,
+        )
+        logger.info(
+            "SQL repair agent | query=%s intent=%s result_type=%s answer_level=%s mode=%s can_answer=%s",
+            (query or "").strip()[:140],
+            repaired.get("intent"),
+            repaired.get("result_type"),
+            repaired.get("answer_level"),
+            repaired.get("execution_mode"),
+            repaired.get("can_answer"),
+        )
+        return repaired
+
+    def _align_plan_with_objective(
+        self,
+        sql_plan: Dict[str, Any],
+        objective_plan: Dict[str, Any],
+        *,
+        query: str,
+    ) -> Dict[str, Any]:
+        objective_intent = str(objective_plan.get("intent") or "")
+        sql_intent = str(sql_plan.get("intent") or "")
+        if objective_intent and sql_intent and objective_intent != sql_intent:
+            if objective_intent == "search" and sql_intent == "aggregate_count":
+                raise OpenAICopilotError(
+                    "Desalineacion agentes: objective=search pero sql_builder=aggregate_count."
+                )
+            if (
+                objective_intent == "aggregate_count"
+                and sql_intent == "search"
+                and self._has_explicit_count_intent(query)
+            ):
+                raise OpenAICopilotError(
+                    "Desalineacion agentes: objective=aggregate_count pero sql_builder=search."
+                )
+            sql_plan["intent"] = objective_intent
+
+        objective_answer_level = str(objective_plan.get("answer_level") or "").strip()
+        if objective_answer_level in _VALID_ANSWER_LEVELS and objective_answer_level != "general":
+            if str(sql_plan.get("answer_level") or "").strip() != objective_answer_level:
+                sql_plan["answer_level"] = objective_answer_level
+
+        objective_text = str(objective_plan.get("objective") or "").strip()
+        if objective_text:
+            sql_plan["objective"] = objective_text
+
+        intent = str(sql_plan.get("intent") or "")
+        result_type = str(sql_plan.get("result_type") or "")
+        can_answer = bool(sql_plan.get("can_answer"))
+        if can_answer and intent == "aggregate_count" and result_type != "aggregate":
+            raise OpenAICopilotError("Plan inconsistente: intent=aggregate_count requiere result_type=aggregate.")
+        if can_answer and intent == "search" and result_type == "aggregate" and not self._has_explicit_count_intent(query):
+            raise OpenAICopilotError("Plan inconsistente: consulta de busqueda no debe devolver agregado.")
+        return sql_plan
+
+    def _normalize_schema_agent_output(self, parsed: Dict[str, Any]) -> Dict[str, Any]:
+        required_keys = {"can_answer", "required_data", "missing_info", "reasoning"}
+        missing_keys = sorted(required_keys.difference(set(parsed.keys())))
+        if missing_keys:
+            raise OpenAICopilotError(
+                "Schema Retrieval agent incompleto. Faltan campos: " + ", ".join(missing_keys)
+            )
+
+        can_answer = self._parse_bool(parsed.get("can_answer"))
+        required_data = self._normalize_required_data(parsed.get("required_data"))
+        missing_info = self._normalize_missing_info(parsed.get("missing_info"))
+        reasoning = str(parsed.get("reasoning") or "").strip()
+
+        preferred_tables: List[str] = []
+        preferred_raw = parsed.get("preferred_tables")
+        if isinstance(preferred_raw, list):
+            preferred_tables = [str(item).strip() for item in preferred_raw if str(item).strip()]
+
+        join_hints: List[str] = []
+        join_raw = parsed.get("join_hints")
+        if isinstance(join_raw, list):
+            join_hints = [str(item).strip() for item in join_raw if str(item).strip()]
+
+        if not can_answer and not missing_info:
+            missing_info = ["No hay informacion suficiente en schema para responder la consulta."]
+
+        return {
+            "can_answer": can_answer,
+            "required_data": required_data,
+            "missing_info": missing_info,
+            "preferred_tables": preferred_tables[:8],
+            "join_hints": join_hints[:12],
+            "reasoning": reasoning,
+        }
+
+    def _normalize_critic_agent_output(self, parsed: Dict[str, Any]) -> Dict[str, Any]:
+        required_keys = {"approved", "action", "issues", "repair_instructions", "reasoning"}
+        missing_keys = sorted(required_keys.difference(set(parsed.keys())))
+        if missing_keys:
+            raise OpenAICopilotError(
+                "SQL Critic agent incompleto. Faltan campos: " + ", ".join(missing_keys)
+            )
+
+        approved = self._parse_bool(parsed.get("approved"))
+        action_raw = str(parsed.get("action") or "").strip().lower()
+        action = action_raw if action_raw in _VALID_CRITIC_ACTIONS else ("accept" if approved else "repair")
+
+        issues_raw = parsed.get("issues")
+        issues = []
+        if isinstance(issues_raw, list):
+            issues = [str(item).strip() for item in issues_raw if str(item).strip()]
+        repair_instructions = str(parsed.get("repair_instructions") or "").strip()
+        reasoning = str(parsed.get("reasoning") or "").strip()
+
+        if approved:
+            action = "accept"
+        elif action == "accept":
+            action = "repair"
+        if not approved and not issues:
+            issues = ["critic_reject_without_details"]
+
+        return {
+            "approved": approved,
+            "action": action,
+            "issues": issues[:12],
+            "repair_instructions": repair_instructions,
             "reasoning": reasoning,
         }
 
@@ -718,10 +1067,151 @@ class OpenAICopilotService:
         )
 
     @staticmethod
+    def _build_schema_retrieval_prompt(
+        *,
+        query: str,
+        objective_plan: Dict[str, Any],
+        schema_context: Dict[str, Any],
+        conversation_history: List[Dict[str, str]],
+    ) -> str:
+        instructions = (
+            "You are Schema Retrieval Agent. "
+            "Your only job is to inspect the provided schema_context and decide what data is needed."
+        )
+        rules = (
+            "Rules:\n"
+            "- Use only tables/columns present in schema_context.\n"
+            "- Do not generate SQL.\n"
+            "- can_answer=true only if required tables/columns exist to answer objective.\n"
+            "- Prefer consolidated views (v_*) before raw tables.\n"
+            "- If objective is candidate-level, include candidate identity columns.\n"
+            "- If objective is organization-level, include organizacion_politica and groupable fields.\n"
+            "- For senado/presidencial context, include segment/election fields.\n"
+            "- Return JSON only."
+        )
+        output_contract = (
+            "Output JSON schema: "
+            '{"can_answer":true,"required_data":[{"table":"t","columns":["c1"],"reason":"..." }],'
+            '"missing_info":[],"preferred_tables":["t1"],"join_hints":["..."],"reasoning":"short"}'
+        )
+        context = {
+            "query": query,
+            "objective_plan": objective_plan,
+            "conversation_history": conversation_history[-3:],
+            "schema_context": schema_context,
+        }
+        return (
+            f"{instructions}\n\n"
+            f"{rules}\n\n"
+            f"{output_contract}\n\n"
+            f"Context JSON:\n{json.dumps(context, ensure_ascii=True)}"
+        )
+
+    @staticmethod
+    def _build_sql_critic_prompt(
+        *,
+        query: str,
+        objective_plan: Dict[str, Any],
+        schema_plan: Dict[str, Any],
+        sql_plan: Dict[str, Any],
+        conversation_history: List[Dict[str, str]],
+    ) -> str:
+        instructions = (
+            "You are SQL Critic Agent. "
+            "Your job is to validate semantic and technical consistency of the SQL plan."
+        )
+        rules = (
+            "Rules:\n"
+            "- Validate alignment with objective_plan (intent, answer_level, entity focus).\n"
+            "- Validate that required_data/schema_plan are respected.\n"
+            "- Reject invented tables/columns or mismatched aggregation semantics.\n"
+            "- If fixable, choose action='repair' and provide precise repair_instructions.\n"
+            "- If severe/unanswerable, choose action='reject'.\n"
+            "- If valid, approved=true and action='accept'.\n"
+            "- Return JSON only."
+        )
+        output_contract = (
+            "Output JSON schema: "
+            '{"approved":true,"action":"accept|repair|reject","issues":["..."],'
+            '"repair_instructions":"...","reasoning":"short"}'
+        )
+        context = {
+            "query": query,
+            "objective_plan": objective_plan,
+            "schema_plan": schema_plan,
+            "sql_plan": sql_plan,
+            "conversation_history": conversation_history[-3:],
+        }
+        return (
+            f"{instructions}\n\n"
+            f"{rules}\n\n"
+            f"{output_contract}\n\n"
+            f"Context JSON:\n{json.dumps(context, ensure_ascii=True)}"
+        )
+
+    @staticmethod
+    def _build_sql_repair_prompt(
+        *,
+        query: str,
+        objective_plan: Dict[str, Any],
+        schema_plan: Dict[str, Any],
+        candidate_sql_plan: Dict[str, Any],
+        critic: Dict[str, Any],
+        limit: int,
+        estado: Optional[str],
+        organizacion: Optional[str],
+        conversation_history: List[Dict[str, str]],
+    ) -> str:
+        filters: Dict[str, str] = {}
+        if estado:
+            filters["estado"] = estado
+        if organizacion:
+            filters["organizacion"] = organizacion
+        safe_limit = max(1, min(limit, 200))
+        instructions = (
+            "You are SQL Repair Agent. "
+            "Repair the candidate SQL plan according to critic feedback."
+        )
+        rules = (
+            "Rules:\n"
+            "- Keep objective, intent and answer_level aligned with objective_plan.\n"
+            "- Use only schema_context-derived tables from schema_plan/required_data.\n"
+            "- Apply request filters if present.\n"
+            "- Produce one final corrected plan in the exact planner schema.\n"
+            "- Respect max row limit.\n"
+            "- Return JSON only."
+        )
+        output_contract = (
+            "Output JSON schema: "
+            '{"objective":"texto","intent":"aggregate_count|search","result_type":"aggregate|rows",'
+            '"answer_level":"candidate|organization|election_segment|general",'
+            '"execution_mode":"sql|derived","derived_resolver":"income_amount_ranking|null",'
+            '"can_answer":true,"required_data":[{"table":"t","columns":["c1"],"reason":"..." }],'
+            '"missing_info":["..."],"sql":"SELECT ...","reasoning":"texto breve"}'
+        )
+        context = {
+            "query": query,
+            "objective_plan": objective_plan,
+            "schema_plan": schema_plan,
+            "candidate_sql_plan": candidate_sql_plan,
+            "critic": critic,
+            "filters": filters,
+            "limit": safe_limit,
+            "conversation_history": conversation_history[-3:],
+        }
+        return (
+            f"{instructions}\n\n"
+            f"{rules}\n\n"
+            f"{output_contract}\n\n"
+            f"Context JSON:\n{json.dumps(context, ensure_ascii=True)}"
+        )
+
+    @staticmethod
     def _build_sql_builder_prompt(
         *,
         query: str,
         objective_plan: Dict[str, Any],
+        schema_plan: Dict[str, Any],
         schema_context: Dict[str, Any],
         limit: int,
         estado: Optional[str],
@@ -744,10 +1234,10 @@ class OpenAICopilotService:
             "- Respeta objective e intent recibidos.\n"
             "- Respeta answer_level recibido (candidate/organization/election_segment/general).\n"
             "- No cambies a aggregate_count si objective_agent dijo search.\n\n"
-            "SECCION 2 - Data Requirements Check:\n"
-            "- Verifica tablas/columnas unicamente desde schema_context.\n"
-            "- Lista required_data con tabla, columnas y razon.\n"
-            "- Si falta data, can_answer=false y explica en missing_info.\n\n"
+            "SECCION 2 - Schema Plan Adherence:\n"
+            "- Usa schema_plan.required_data como base principal de tablas/columnas.\n"
+            "- No salgas de schema_context.\n"
+            "- Si agregas tabla extra, justificala en required_data.reason.\n\n"
             "SECCION 3 - SQL Generation:\n"
             "- Genera una sola sentencia SELECT o WITH...SELECT, sin ';'.\n"
             "- Si intent=aggregate_count, devuelve una sola fila con alias 'total'.\n"
@@ -762,6 +1252,7 @@ class OpenAICopilotService:
             "- Usa domain_guide y catalogs del contexto para entender senado/presidencial/tipos/partidos.\n"
             "- Si query menciona senado/presidencial, SQL debe incluir filtro explicito por segmento/tipo_eleccion.\n"
             "- Si query menciona partido/organizacion, SQL debe usar organizacion_politica.\n"
+            "- Si la pregunta es sobre una persona especifica (ej. 'dame informacion acerca de <nombre>'), prioriza buscar por nombre_completo con tokens y devuelve perfil de candidato.\n"
             "- Prioriza vistas/tablas estructuradas (ej. v_*). Usa tablas *_raw solo como ultimo recurso.\n"
             "- Si usas una tabla *_raw, explica por que en required_data.reason.\n"
             "- Solo usa intent='aggregate_count' cuando la pregunta pida cantidad/total explicito (cuantos/cantidad/numero/total/contar).\n"
@@ -831,11 +1322,18 @@ class OpenAICopilotService:
             '"required_data":[{"table":"declaracion_ingresos","columns":["id_hoja_vida","payload"],"reason":"extraer montos de ingresos desde payload"},'
             '{"table":"candidatos","columns":["id_hoja_vida","nombre_completo","organizacion_politica","cargo","estado"],"reason":"enriquecer ranking por candidato"}],'
             '"missing_info":[],"sql":null,"reasoning":"se requiere parseo de payload para monto aproximado de ingresos"}'
+            "\n8) Pregunta: 'dame informacion acerca de George Forsyth'\n"
+            'Salida esperada (shape): {"objective":"mostrar perfil del candidato solicitado por nombre","intent":"search","result_type":"rows",'
+            '"answer_level":"candidate","execution_mode":"sql","derived_resolver":null,"can_answer":true,'
+            '"required_data":[{"table":"v_copilot_context","columns":["id_hoja_vida","nombre_completo","organizacion_politica","cargo","estado","sentencias_penales_count","sentencias_obligaciones_count","expedientes_count","ingresos_count"],"reason":"perfil y contadores estructurados del candidato"}],'
+            '"missing_info":[],"sql":"select id_hoja_vida, nombre_completo, organizacion_politica, cargo, estado, sentencias_penales_count, sentencias_obligaciones_count, expedientes_count, ingresos_count from jne.v_copilot_context where upper(coalesce(nombre_completo, \'\')) like \'%GEORGE%\' and upper(coalesce(nombre_completo, \'\')) like \'%FORSYTH%\' order by nombre_completo asc limit 20",'
+            '"reasoning":"consulta por identidad de persona; se filtra por tokens del nombre"}'
         )
 
         context = {
             "query": query,
             "objective_plan": objective_plan,
+            "schema_plan": schema_plan,
             "filters": filters,
             "conversation_history": conversation_history[-3:],
             "schema_context": schema_context,
