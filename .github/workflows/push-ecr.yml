@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 env:
-  AWS_REGION: ${{ vars.AWS_REGION }}
-  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  AWS_REGION: ${{ vars.AWS_REGION || secrets.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || secrets.ECR_REPOSITORY }}
 
 jobs:
   build-and-push:
@@ -25,8 +25,8 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
-          test -n "${AWS_REGION}" || (echo "Missing repo variable AWS_REGION" && exit 1)
-          test -n "${ECR_REPOSITORY}" || (echo "Missing repo variable ECR_REPOSITORY" && exit 1)
+          test -n "${AWS_REGION}" || (echo "Missing AWS_REGION (set repo variable or secret)" && exit 1)
+          test -n "${ECR_REPOSITORY}" || (echo "Missing ECR_REPOSITORY (set repo variable or secret)" && exit 1)
           test -n "${AWS_ACCESS_KEY_ID}" || (echo "Missing secret AWS_ACCESS_KEY_ID" && exit 1)
           test -n "${AWS_SECRET_ACCESS_KEY}" || (echo "Missing secret AWS_SECRET_ACCESS_KEY" && exit 1)
 
