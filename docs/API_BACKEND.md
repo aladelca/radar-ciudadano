@@ -45,7 +45,7 @@ El backend soporta controles por entorno para exposicion publica:
 
 - API keys por header `X-API-Key`,
 - enforcement separado para lectura y para IA,
-- rate limiting independiente para lectura y `ask-ai`,
+- rate limiting independiente para lectura, `copilot/ask` y `copilot/ask-ai`,
 - CORS por origen.
 
 Variables relevantes en `.env`:
@@ -56,6 +56,7 @@ Variables relevantes en `.env`:
 - `BETA_ENFORCE_API_KEY_READ`
 - `BETA_ENFORCE_API_KEY_AI`
 - `BETA_RATE_LIMIT_READ_PER_MINUTE`
+- `BETA_RATE_LIMIT_COPILOT_PER_MINUTE`
 - `BETA_RATE_LIMIT_AI_PER_MINUTE`
 - `BETA_RATE_LIMIT_WINDOW_SECONDS`
 - `READONLY_SQL_TIMEOUT_MS`

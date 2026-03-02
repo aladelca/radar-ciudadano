@@ -27,7 +27,7 @@ sin exponer la plataforma a abuso de trafico ni a consultas peligrosas.
   - `POST /api/v1/copilot/ask-ai` (controlado por key)
 - Capa de seguridad API:
   - API keys por header `X-API-Key`.
-  - Rate limiting para lectura y IA.
+  - Rate limiting para lectura, `copilot/ask` y `copilot/ask-ai`.
   - CORS explicito por origen.
   - Guardrails SQL readonly endurecidos para planner IA.
 
@@ -90,6 +90,7 @@ Estado actual:
 - `BETA_ENFORCE_API_KEY_AI`
 - `BETA_ALLOW_ANON_HEALTH`
 - `BETA_RATE_LIMIT_READ_PER_MINUTE`
+- `BETA_RATE_LIMIT_COPILOT_PER_MINUTE`
 - `BETA_RATE_LIMIT_AI_PER_MINUTE`
 - `BETA_RATE_LIMIT_WINDOW_SECONDS`
 - `BETA_TRUST_PROXY_HEADERS`
@@ -101,6 +102,7 @@ Estado actual:
 - `BETA_ENFORCE_API_KEY_READ=false`
 - `BETA_ENFORCE_API_KEY_AI=true`
 - `BETA_RATE_LIMIT_READ_PER_MINUTE=120`
+- `BETA_RATE_LIMIT_COPILOT_PER_MINUTE=40`
 - `BETA_RATE_LIMIT_AI_PER_MINUTE=20`
 - `READONLY_SQL_TIMEOUT_MS=2500`
 - `READONLY_SQL_MAX_ROWS=50`

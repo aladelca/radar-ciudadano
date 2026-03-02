@@ -55,6 +55,7 @@ class AppConfig:
     beta_enforce_api_key_ai: bool
     beta_allow_anon_health: bool
     beta_rate_limit_read_per_minute: int
+    beta_rate_limit_copilot_per_minute: int
     beta_rate_limit_ai_per_minute: int
     beta_rate_limit_window_seconds: int
     beta_trust_proxy_headers: bool
@@ -162,6 +163,7 @@ class AppConfig:
             beta_enforce_api_key_ai=_env_bool("BETA_ENFORCE_API_KEY_AI", True),
             beta_allow_anon_health=_env_bool("BETA_ALLOW_ANON_HEALTH", True),
             beta_rate_limit_read_per_minute=max(0, int(os.getenv("BETA_RATE_LIMIT_READ_PER_MINUTE", "120"))),
+            beta_rate_limit_copilot_per_minute=max(0, int(os.getenv("BETA_RATE_LIMIT_COPILOT_PER_MINUTE", "40"))),
             beta_rate_limit_ai_per_minute=max(0, int(os.getenv("BETA_RATE_LIMIT_AI_PER_MINUTE", "20"))),
             beta_rate_limit_window_seconds=max(1, int(os.getenv("BETA_RATE_LIMIT_WINDOW_SECONDS", "60"))),
             beta_trust_proxy_headers=_env_bool("BETA_TRUST_PROXY_HEADERS", True),

@@ -278,7 +278,7 @@ Para una beta publica, el backend soporta controles operativos por entorno:
 
 - API keys por `X-API-Key` (`BETA_API_KEYS`).
 - Enforcement separado para lectura e IA (`BETA_ENFORCE_API_KEY_READ`, `BETA_ENFORCE_API_KEY_AI`).
-- Rate limit por minuto para lectura e IA.
+- Rate limit por minuto para lectura, `copilot/ask` y `copilot/ask-ai`.
 - CORS por lista de origenes permitidos (`API_CORS_ALLOW_ORIGINS`).
 - Guardrails SQL readonly para planner IA (`READONLY_SQL_TIMEOUT_MS`, `READONLY_SQL_MAX_ROWS`).
 

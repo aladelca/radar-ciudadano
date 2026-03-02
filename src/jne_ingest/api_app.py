@@ -7,6 +7,7 @@ import re
 from threading import Lock
 import time
 from typing import Any, Deque, Dict, List, Optional
+import unicodedata
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -34,6 +35,73 @@ _SEGMENT_SENADO_PATTERN = re.compile(r"\b(senad|senador|senadores|senado)\b", fl
 _SEGMENT_PRESIDENCIAL_PATTERN = re.compile(
     r"\b(presidencial|presidente|presidencia)\b",
     flags=re.IGNORECASE,
+)
+_COPILOT_ASK_PATH = "/api/v1/copilot/ask"
+_COPILOT_ASK_AI_PATH = "/api/v1/copilot/ask-ai"
+_PERSON_QUERY_FILLER_TOKENS = frozenset(
+    {
+        "dame",
+        "darme",
+        "info",
+        "informacion",
+        "acerca",
+        "sobre",
+        "de",
+        "del",
+        "la",
+        "el",
+        "los",
+        "las",
+        "para",
+        "por",
+        "favor",
+        "quiero",
+        "necesito",
+        "ver",
+        "perfil",
+        "detalle",
+        "detalles",
+        "datos",
+        "quien",
+        "es",
+    }
+)
+_PERSON_QUERY_TOPIC_TOKENS = frozenset(
+    {
+        "candidato",
+        "candidatos",
+        "partido",
+        "partidos",
+        "organizacion",
+        "organizaciones",
+        "sentencia",
+        "sentencias",
+        "denuncia",
+        "denuncias",
+        "ingreso",
+        "ingresos",
+        "bienes",
+        "universidad",
+        "universidades",
+        "estudio",
+        "estudios",
+        "senado",
+        "senador",
+        "senadores",
+        "presidencia",
+        "presidencial",
+        "presidente",
+        "top",
+        "mas",
+        "mayor",
+        "cuanto",
+        "cuantos",
+        "cuanta",
+        "cuantas",
+        "cantidad",
+        "numero",
+        "total",
+    }
 )
 
 
@@ -130,6 +198,14 @@ def create_app() -> FastAPI:
         if config.beta_rate_limit_read_per_minute > 0
         else None
     )
+    app.state.copilot_rate_limiter = (
+        InMemoryRateLimiter(
+            max_requests=config.beta_rate_limit_copilot_per_minute,
+            window_seconds=config.beta_rate_limit_window_seconds,
+        )
+        if config.beta_rate_limit_copilot_per_minute > 0
+        else None
+    )
     app.state.ai_rate_limiter = (
         InMemoryRateLimiter(
             max_requests=config.beta_rate_limit_ai_per_minute,
@@ -167,7 +243,7 @@ def create_app() -> FastAPI:
     def _rate_limit_identity(request: Request) -> str:
         api_key = _request_api_key(request)
         configured_keys = app.state.beta_api_key_set
-        if api_key and (not configured_keys or api_key in configured_keys):
+        if configured_keys and api_key and api_key in configured_keys:
             return f"key:{api_key}"
         return _client_identity(request)
 
@@ -209,8 +285,14 @@ def create_app() -> FastAPI:
             return await call_next(request)
 
         limiter = app.state.read_rate_limiter
-        if path == "/api/v1/copilot/ask-ai":
-            limiter = app.state.ai_rate_limiter
+        if path == _COPILOT_ASK_PATH:
+            limiter = app.state.copilot_rate_limiter or app.state.read_rate_limiter
+        elif path == _COPILOT_ASK_AI_PATH:
+            limiter = (
+                app.state.ai_rate_limiter
+                or app.state.copilot_rate_limiter
+                or app.state.read_rate_limiter
+            )
 
         identity = _rate_limit_identity(request)
         if limiter and not limiter.allow(identity):
@@ -237,7 +319,7 @@ def create_app() -> FastAPI:
             signing_key=config.copilot_session_signing_key,
         )
         logger.info(
-            "API startup complete | process_id=%s openai_configured=%s model=%s dashboard_cache_ttl=%s api_keys=%s enforce_read=%s enforce_ai=%s cors=%s",
+            "API startup complete | process_id=%s openai_configured=%s model=%s dashboard_cache_ttl=%s api_keys=%s enforce_read=%s enforce_ai=%s rate_read=%s rate_copilot=%s rate_ai=%s cors=%s",
             config.process_id,
             bool(config.openai_api_key),
             config.openai_model,
@@ -245,6 +327,9 @@ def create_app() -> FastAPI:
             len(config.beta_api_keys),
             config.beta_enforce_api_key_read,
             config.beta_enforce_api_key_ai,
+            config.beta_rate_limit_read_per_minute,
+            config.beta_rate_limit_copilot_per_minute,
+            config.beta_rate_limit_ai_per_minute,
             len(config.api_cors_allow_origins),
         )
 
@@ -286,6 +371,7 @@ def create_app() -> FastAPI:
             "beta_enforce_api_key_read": app.state.config.beta_enforce_api_key_read,
             "beta_enforce_api_key_ai": app.state.config.beta_enforce_api_key_ai,
             "rate_limit_read_per_minute": app.state.config.beta_rate_limit_read_per_minute,
+            "rate_limit_copilot_per_minute": app.state.config.beta_rate_limit_copilot_per_minute,
             "rate_limit_ai_per_minute": app.state.config.beta_rate_limit_ai_per_minute,
         }
 
@@ -494,7 +580,7 @@ def create_app() -> FastAPI:
                         if isinstance(item, dict) and item.get("table")
                     ]
                 logger.info(
-                    "copilot.ask_ai.plan | trace=%s intent=%s result_type=%s answer_level=%s execution_mode=%s derived_resolver=%s can_answer=%s objective=%s required_tables=%s missing_info=%s",
+                    "copilot.ask_ai.plan | trace=%s intent=%s result_type=%s answer_level=%s execution_mode=%s derived_resolver=%s can_answer=%s critic_action=%s critic_repair_used=%s objective=%s required_tables=%s missing_info=%s",
                     trace_id,
                     sql_plan.get("intent"),
                     sql_plan.get("result_type"),
@@ -502,6 +588,16 @@ def create_app() -> FastAPI:
                     sql_plan.get("execution_mode"),
                     sql_plan.get("derived_resolver"),
                     sql_plan.get("can_answer"),
+                    (
+                        (sql_plan.get("critic_decision") or {}).get("action")
+                        if isinstance(sql_plan.get("critic_decision"), dict)
+                        else None
+                    ),
+                    (
+                        (sql_plan.get("critic_decision") or {}).get("repair_used")
+                        if isinstance(sql_plan.get("critic_decision"), dict)
+                        else None
+                    ),
                     str(sql_plan.get("objective") or "")[:140],
                     ",".join(required_tables) if required_tables else "-",
                     len(sql_plan.get("missing_info") or []),
@@ -556,6 +652,25 @@ def create_app() -> FastAPI:
                             str(sql_plan.get("sql")),
                             limit=max(payload.limit, 20),
                         )
+                        rescue_rows = _rescue_identity_query_rows(
+                            repo,
+                            query=payload.query,
+                            rows=rows,
+                            sql_plan=sql_plan,
+                            limit=payload.limit,
+                            estado=effective_estado,
+                            organizacion=payload.organizacion,
+                            trace_id=trace_id,
+                        )
+                        if rescue_rows is not None:
+                            rows = rescue_rows
+                            planner_warning = (
+                                planner_warning
+                                or "Planner SQL IA devolvio 0 filas en consulta por nombre; se aplico busqueda local por identidad."
+                            )
+                            for table_name in ("v_copilot_context", "candidatos"):
+                                if table_name not in required_tables:
+                                    required_tables.append(table_name)
                     if (
                         str(sql_plan.get("result_type") or "") == "rows"
                         and str(sql_plan.get("answer_level") or "general") == "candidate"
@@ -1219,3 +1334,108 @@ def _run_derived_resolver(
             "source_tables": ["declaracion_ingresos", "candidatos"],
         }
     raise OpenAICopilotError(f"Resolver derivado no soportado: {resolver_name}")
+
+
+def _normalize_for_identity(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value or "").strip().lower())
+    without_marks = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return re.sub(r"\s+", " ", without_marks)
+
+
+def _tokenize_for_identity(value: str) -> List[str]:
+    return re.findall(r"[a-z0-9]+", _normalize_for_identity(value))
+
+
+def _is_candidate_identity_query(query: str) -> bool:
+    tokens = _tokenize_for_identity(query)
+    if not tokens:
+        return False
+    content_tokens = [token for token in tokens if token not in _PERSON_QUERY_FILLER_TOKENS]
+    if not content_tokens:
+        return False
+    if any(token in _PERSON_QUERY_TOPIC_TOKENS for token in content_tokens):
+        return False
+    if len(content_tokens) > 4:
+        return False
+    alpha_tokens = [token for token in content_tokens if re.fullmatch(r"[a-z]+", token)]
+    if not alpha_tokens:
+        return False
+    return True
+
+
+def _is_high_confidence_identity_match(query: str, row: Dict[str, Any]) -> bool:
+    try:
+        score = float(row.get("score") or 0)
+    except (TypeError, ValueError):
+        score = 0.0
+    if score >= 200:
+        return True
+
+    query_tokens = [
+        token
+        for token in _tokenize_for_identity(query)
+        if token not in _PERSON_QUERY_FILLER_TOKENS
+        and token not in _PERSON_QUERY_TOPIC_TOKENS
+        and len(token) >= 4
+    ]
+    if not query_tokens:
+        return False
+
+    name_tokens = set(_tokenize_for_identity(str(row.get("nombre_completo") or "")))
+    overlap = [token for token in query_tokens if token in name_tokens]
+    required_overlap = 2 if len(query_tokens) >= 2 else 1
+    return len(overlap) >= required_overlap
+
+
+def _rescue_identity_query_rows(
+    repo: CandidateReadRepository,
+    *,
+    query: str,
+    rows: List[Dict[str, Any]],
+    sql_plan: Dict[str, Any],
+    limit: int,
+    estado: Optional[str],
+    organizacion: Optional[str],
+    trace_id: str,
+) -> Optional[List[Dict[str, Any]]]:
+    if rows:
+        return None
+    can_answer_raw = sql_plan.get("can_answer")
+    if isinstance(can_answer_raw, str):
+        can_answer = can_answer_raw.strip().lower() in {"true", "1", "yes", "si"}
+    else:
+        can_answer = bool(can_answer_raw)
+    if not can_answer:
+        return None
+    if str(sql_plan.get("intent") or "").strip().lower() != "search":
+        return None
+    if str(sql_plan.get("result_type") or "").strip().lower() != "rows":
+        return None
+    if str(sql_plan.get("answer_level") or "").strip().lower() != "candidate":
+        return None
+    if str(sql_plan.get("execution_mode") or "sql").strip().lower() != "sql":
+        return None
+    if not _is_candidate_identity_query(query):
+        return None
+
+    rescued_rows = repo.search_candidates(
+        query,
+        limit=limit,
+        estado=estado,
+        organizacion=organizacion,
+    )
+    if not rescued_rows:
+        return None
+    if not _is_high_confidence_identity_match(query, rescued_rows[0]):
+        return None
+
+    top_row = rescued_rows[0]
+    logger.info(
+        "copilot.ask_ai.identity_rescue | trace=%s rows=%s top_id=%s top_score=%s top_name=%s",
+        trace_id,
+        len(rescued_rows),
+        top_row.get("id_hoja_vida"),
+        top_row.get("score"),
+        str(top_row.get("nombre_completo") or "")[:120],
+    )
+    return rescued_rows
