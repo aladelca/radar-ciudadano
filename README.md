@@ -295,6 +295,28 @@ source .venv/bin/activate
 python scripts/smoke_api_beta.py --base-url "http://127.0.0.1:8010" --api-key "<API_KEY_BETA>" --include-ai
 ```
 
+## CI/CD GitHub Actions -> ECR
+
+El repo incluye workflow para construir imagen Docker y subirla a ECR en cada push a `main`:
+
+- `.github/workflows/push-ecr.yml`
+
+### Variables y secrets en GitHub
+
+En `Settings > Secrets and variables > Actions`:
+
+- Variables (`Repository variables`):
+  - `AWS_REGION` (ej: `us-east-1`)
+  - `ECR_REPOSITORY` (ej: `congreso-votaciones-api`)
+- Secrets:
+  - `AWS_ACCESS_KEY_ID`
+  - `AWS_SECRET_ACCESS_KEY`
+
+### Resultado del workflow
+
+- Publica tags en ECR: `sha-<commit>`, `<branch>`, y `latest` (solo en rama default).
+- Si el repositorio ECR no existe, lo crea automaticamente con `scanOnPush=true`.
+
 ## Copilot IA (OpenAI)
 
 Si quieres respuestas narrativas asistidas por modelo:
