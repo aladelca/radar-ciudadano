@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Votaciones 2026 | Radar Ciudadano</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/ui/static/styles.css" />
+</head>
+<body>
+  <div class="bg-layer"></div>
+  <main class="page">
+    <header class="hero reveal">
+      <p class="eyebrow">Elecciones 2026</p>
+      <h1>Coffee &amp; Data</h1>
+      <p class="byline">By: Carlos Adrián Alarcón</p>
+      <p class="subtitle">
+        Dashboard inicial con señales de ingresos, denuncias y universidades, conectado a la base de datos del proyecto.
+      </p>
+      <div class="dashboard-filters">
+        <label for="dashboardTipoEleccion">Tipo de eleccion</label>
+        <select id="dashboardTipoEleccion">
+          <option value="">Todos</option>
+        </select>
+      </div>
+      <div class="meta-line">
+        <span id="generatedAt">Actualizando...</span>
+        <span class="dot-separator">•</span>
+        <span id="dashboardFilterInfo">Tipo de eleccion: Todos</span>
+      </div>
+    </header>
+
+    <section class="stats reveal">
+      <article class="stat-card">
+        <p class="label">Candidatos</p>
+        <p id="statCandidates" class="value">-</p>
+      </article>
+      <article class="stat-card">
+        <p class="label">Con ingresos</p>
+        <p id="statIncome" class="value">-</p>
+      </article>
+      <article class="stat-card">
+        <p class="label">Con denuncias</p>
+        <p id="statDenuncias" class="value">-</p>
+      </article>
+      <article class="stat-card">
+        <p class="label">Con universidad</p>
+        <p id="statUniversidades" class="value">-</p>
+      </article>
+    </section>
+
+    <section class="charts reveal">
+      <article class="panel chart-panel">
+        <div class="panel-head">
+          <h2>Distribucion de ingresos</h2>
+          <p id="noteIngresos" class="note">-</p>
+        </div>
+        <canvas id="chartIngresos"></canvas>
+      </article>
+      <article class="panel chart-panel">
+        <div class="panel-head">
+          <h2>Denuncias por candidato</h2>
+          <p id="noteDenuncias" class="note">-</p>
+        </div>
+        <canvas id="chartDenuncias"></canvas>
+      </article>
+      <article class="panel chart-panel">
+        <div class="panel-head">
+          <h2>Universidades mas frecuentes</h2>
+          <p id="noteUniversidades" class="note">-</p>
+        </div>
+        <canvas id="chartUniversidades"></canvas>
+      </article>
+    </section>
+
+    <section class="copilot reveal">
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Copilot ciudadano</h2>
+          <p class="note">Hace preguntas sobre la base de datos local de candidatos.</p>
+        </div>
+
+        <form id="copilotForm" class="ask-form">
+          <input
+            id="copilotQuery"
+            type="text"
+            maxlength="400"
+            placeholder="Ejemplo: candidatos con sentencias y expedientes en lima"
+            required
+          />
+          <label for="copilotUseAi" class="toggle-ai">
+            <input id="copilotUseAi" type="checkbox" checked />
+            <span>Usar IA</span>
+          </label>
+          <button type="submit" id="copilotBtn">Consultar</button>
+        </form>
+
+        <p id="copilotModeInfo" class="note mode-info">Modo actual: IA</p>
+        <div id="copilotStatus" class="status"></div>
+        <div id="copilotSummary" class="summary"></div>
+        <div id="copilotCandidates" class="results"></div>
+      </article>
+    </section>
+
+    <footer class="footer">
+      <p>
+        Disclaimer: La IA puede cometer errores. Los datos mostrados provienen de fuentes públicas y pueden tener desfases o inconsistencias de origen.
+      </p>
+    </footer>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <script src="/ui/static/app.js"></script>
+</body>
+</html>
