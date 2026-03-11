@@ -359,3 +359,4 @@ Puedes reenviar `session_id` en el body para continuidad:
 - Base de consulta para copilot ciudadano implementada (vista + funcion + CLI).
 - API backend de consulta/copilot implementada con FastAPI.
 - Fase Instagram iniciada: plan, migracion base social y endpoint de lectura por candidato.
+
